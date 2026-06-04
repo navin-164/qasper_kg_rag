@@ -1,0 +1,13 @@
+datasets
+neo4j
+networkx
+spacy
+sentence-transformers
+faiss-cpu
+fastapi
+uvicorn
+python-dotenv
+tqdm
+requests
+numpy
+pandas
