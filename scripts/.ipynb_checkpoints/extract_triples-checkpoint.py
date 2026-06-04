@@ -14,6 +14,12 @@ try:
 except Exception:
     spacy = None
 
+# --- NEW LLM IMPORTS ---
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+# -----------------------
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -139,11 +145,36 @@ def cooccurrence_triples(sentence: str, nlp=None) -> List[Dict[str, Any]]:
     return triples
 
 
+# --- NEW LLM SETUP FUNCTION ---
+def setup_llm_extractor(model_name="llama3"):
+    """Initializes the local Ollama LLM and enforces JSON schema output."""
+    llm = ChatOllama(model=model_name, temperature=0.0, format="json")
+    parser = JsonOutputParser()
+    
+    prompt = PromptTemplate(
+        template="""Extract the core semantic relationships from the following academic sentence.
+        Format the output strictly as a JSON array of objects. Each object MUST contain exactly these keys: 'subject', 'relation', 'object'.
+        
+        Rules:
+        1. Subjects and Objects should be concise noun phrases.
+        2. Relations should be clear verbs, uppercase, with underscores for spaces (e.g., 'EVALUATES_ON').
+        3. Do not invent information.
+        
+        Sentence: {text}
+        """,
+        input_variables=["text"]
+    )
+    return prompt | llm | parser
+# ------------------------------
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="data/processed/paragraphs.jsonl")
     parser.add_argument("--output", default="data/triples/triples.jsonl")
     parser.add_argument("--max_rows", type=int, default=None)
+    # Added argument to specify the LLM model
+    parser.add_argument("--model", type=str, default="llama3", help="Ollama model to use") 
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -156,29 +187,52 @@ def main() -> None:
         rows = rows[: args.max_rows]
 
     out = []
+    
+    # Initialize the LLM Chain
+    print(f"Initializing local LLM extractor using model: {args.model}")
+    llm_extractor = setup_llm_extractor(model_name=args.model)
 
     for row in tqdm(rows, desc="Extracting triples"):
         sentences = split_sentences(row["text"], nlp=nlp)
 
         for sent in sentences:
-            triples = pattern_triples(sent)
-            if not triples:
-                triples = cooccurrence_triples(sent, nlp=nlp)
+            
+            # --- MODIFIED EXTRACTION LOGIC ---
+            # Try LLM extraction first
+            try:
+                llm_response = llm_extractor.invoke({"text": sent})
+                triples = llm_response if isinstance(llm_response, list) else [llm_response]
+                
+                # Format relations to match your Neo4j styling
+                for t in triples:
+                    if all(k in t for k in ["subject", "relation", "object"]):
+                        t["subject"] = clean_phrase(t["subject"])
+                        t["relation"] = str(t["relation"]).strip().upper().replace(" ", "_")
+                        t["object"] = clean_phrase(t["object"])
+                        t["confidence"] = 0.95 # Higher confidence for LLM extraction
+            except Exception as e:
+                # If LLM fails (e.g., JSON parsing error), gracefully fall back to original logic
+                triples = pattern_triples(sent)
+                if not triples:
+                    triples = cooccurrence_triples(sent, nlp=nlp)
+            # ---------------------------------
 
             for t in triples:
-                out.append(
-                    {
-                        "paper_id": row["paper_id"],
-                        "paragraph_id": row["paragraph_id"],
-                        "section_idx": row["section_idx"],
-                        "section_name": row["section_name"],
-                        "sentence": sent,
-                        "subject": t["subject"],
-                        "relation": t["relation"],
-                        "object": t["object"],
-                        "confidence": t["confidence"],
-                    }
-                )
+                # Retains original dictionary structure
+                if "subject" in t and "relation" in t and "object" in t:
+                    out.append(
+                        {
+                            "paper_id": row["paper_id"],
+                            "paragraph_id": row["paragraph_id"],
+                            "section_idx": row["section_idx"],
+                            "section_name": row["section_name"],
+                            "sentence": sent,
+                            "subject": t["subject"],
+                            "relation": t["relation"],
+                            "object": t["object"],
+                            "confidence": t.get("confidence", 0.75),
+                        }
+                    )
 
     write_jsonl(output_path, out)
     print(f"Saved {len(out)} triples to {output_path}")
