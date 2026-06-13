@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from dotenv import load_dotenv
 from tqdm import tqdm
 
 try:
@@ -14,12 +16,11 @@ try:
 except Exception:
     spacy = None
 
-# --- NEW LLM IMPORTS ---
-from langchain_ollama import ChatOllama
+# --- NEW GROQ IMPORTS ---
+from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-# -----------------------
-
+# ------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -145,10 +146,19 @@ def cooccurrence_triples(sentence: str, nlp=None) -> List[Dict[str, Any]]:
     return triples
 
 
-# --- NEW LLM SETUP FUNCTION ---
-def setup_llm_extractor(model_name="llama3"):
-    """Initializes the local Ollama LLM and enforces JSON schema output."""
-    llm = ChatOllama(model=model_name, temperature=0.0, format="json")
+def setup_llm_extractor():
+    """Initializes the Groq API and enforces strict JSON schema output."""
+    load_dotenv()
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
+
+    llm = ChatGroq(
+        model_name="llama-3.1-8b-instant",
+        temperature=0.0,
+        groq_api_key=groq_api_key
+    )
+    
     parser = JsonOutputParser()
     
     prompt = PromptTemplate(
@@ -160,12 +170,20 @@ def setup_llm_extractor(model_name="llama3"):
         2. Relations should be clear verbs, uppercase, with underscores for spaces (e.g., 'EVALUATES_ON').
         3. Do not invent information.
         
+        CRITICAL INSTRUCTIONS: 
+        - DO NOT write any Python code.
+        - DO NOT provide explanations. 
+        - DO NOT use markdown formatting like ```json.
+        - OUTPUT ONLY THE RAW JSON ARRAY.
+        
+        {format_instructions}
+        
         Sentence: {text}
         """,
-        input_variables=["text"]
+        input_variables=["text"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
     )
     return prompt | llm | parser
-# ------------------------------
 
 
 def main() -> None:
@@ -173,8 +191,6 @@ def main() -> None:
     parser.add_argument("--input", default="data/processed/paragraphs.jsonl")
     parser.add_argument("--output", default="data/triples/triples.jsonl")
     parser.add_argument("--max_rows", type=int, default=None)
-    # Added argument to specify the LLM model
-    parser.add_argument("--model", type=str, default="llama3", help="Ollama model to use") 
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -188,38 +204,29 @@ def main() -> None:
 
     out = []
     
-    # Initialize the LLM Chain
-    print(f"Initializing local LLM extractor using model: {args.model}")
-    llm_extractor = setup_llm_extractor(model_name=args.model)
+    print("Initializing Groq LLM extractor...")
+    llm_extractor = setup_llm_extractor()
 
     for row in tqdm(rows, desc="Extracting triples"):
         sentences = split_sentences(row["text"], nlp=nlp)
 
         for sent in sentences:
-            
-            # --- MODIFIED EXTRACTION LOGIC ---
             try:
-                # 1. Invoke the LLM
                 llm_response = llm_extractor.invoke({"text": sent})
-                print(f"\n[RAW LLM OUTPUT for '{sent[:30]}...']: {llm_response}")
                 
-                # 2. Smart Unwrapping (Handles "data" wrappers)
                 triples = []
                 if isinstance(llm_response, list):
                     triples = llm_response
                 elif isinstance(llm_response, dict):
-                    # Check if it's a single triple directly
                     if "subject" in [k.lower() for k in llm_response.keys()]:
                         triples = [llm_response]
                     else:
-                        # Dig into keys like 'data' or 'semantic_relationships' to find the list
                         for val in llm_response.values():
                             if isinstance(val, list):
                                 triples.extend(val)
                 
-                # 3. Robust key mapping
                 for t in triples:
-                    if not isinstance(t, dict): # Skip weirdly formatted items
+                    if not isinstance(t, dict): 
                         continue
                         
                     safe_t = {str(k).lower(): v for k, v in t.items()}
@@ -241,27 +248,22 @@ def main() -> None:
                             "confidence": 0.95
                         })
             except Exception as e:
-                print(f"\n[LLM ERROR]: {e}")
                 triples = pattern_triples(sent)
-            # ---------------------------------
-            # ---------------------------------
-
-            for t in triples:
-                # Retains original dictionary structure
-                if "subject" in t and "relation" in t and "object" in t:
-                    out.append(
-                        {
-                            "paper_id": row["paper_id"],
-                            "paragraph_id": row["paragraph_id"],
-                            "section_idx": row["section_idx"],
-                            "section_name": row["section_name"],
-                            "sentence": sent,
-                            "subject": t["subject"],
-                            "relation": t["relation"],
-                            "object": t["object"],
-                            "confidence": t.get("confidence", 0.75),
-                        }
-                    )
+                for t in triples:
+                    if "subject" in t and "relation" in t and "object" in t:
+                        out.append(
+                            {
+                                "paper_id": row["paper_id"],
+                                "paragraph_id": row["paragraph_id"],
+                                "section_idx": row["section_idx"],
+                                "section_name": row["section_name"],
+                                "sentence": sent,
+                                "subject": t["subject"],
+                                "relation": t["relation"],
+                                "object": t["object"],
+                                "confidence": t.get("confidence", 0.75),
+                            }
+                        )
 
     write_jsonl(output_path, out)
     print(f"Saved {len(out)} triples to {output_path}")

@@ -35,7 +35,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="data/processed/paragraphs.jsonl")
     parser.add_argument("--output_dir", default="data")
-    parser.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2")
+    # --- UPGRADED EMBEDDING MODEL ---
+    parser.add_argument("--model", default="BAAI/bge-base-en-v1.5")
+    # --------------------------------
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -48,6 +50,7 @@ def main() -> None:
     rows = read_jsonl(input_path)
     texts = [r["text"] for r in rows]
 
+    print(f"Loading embedding model: {args.model}")
     model = SentenceTransformer(args.model)
     embeddings = model.encode(texts, batch_size=32, show_progress_bar=True)
     embeddings = np.asarray(embeddings, dtype="float32")

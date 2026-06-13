@@ -16,6 +16,10 @@ from neo4j import GraphDatabase
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
+from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -51,6 +55,7 @@ class RagArtifacts:
     embedder: SentenceTransformer
     faiss_index: faiss.Index
     paragraphs: List[Dict[str, Any]]
+    llm: ChatGroq
 
 
 def normalize_text(text: str) -> str:
@@ -62,18 +67,15 @@ def tokenize(text: str) -> List[str]:
     return [t for t in tokens if t not in STOPWORDS and len(t) > 1]
 
 
-def extract_question_entities(question: str) -> List[str]:
+def fallback_extract_entities(question: str) -> List[str]:
     question = normalize_text(question)
     ents = []
-
     for m in re.finditer(r"\b[A-Z][A-Za-z0-9\-]+(?:\s+[A-Z][A-Za-z0-9\-]+)*\b", question):
         val = normalize_text(m.group(0))
         if len(val) > 1:
             ents.append(val)
-
     if not ents:
         ents = [w for w in re.findall(r"[A-Za-z0-9\-]+", question) if len(w) > 2]
-
     return sorted(set(ents))
 
 
@@ -93,9 +95,19 @@ def load_artifacts() -> RagArtifacts:
     password = os.getenv("NEO4J_PASSWORD", "password123")
     database = os.getenv("NEO4J_DATABASE", "neo4j")
     embedding_model = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY is missing from the environment variables.")
 
     driver = GraphDatabase.driver(uri, auth=(user, password))
     embedder = SentenceTransformer(embedding_model)
+    
+    llm = ChatGroq(
+        model_name="llama-3.1-8b-instant", 
+        temperature=0.0,
+        groq_api_key=groq_api_key
+    )
 
     faiss_path = PROJECT_ROOT / "data/faiss/paragraph.index"
     meta_path = PROJECT_ROOT / "data/embeddings/paragraph_meta.jsonl"
@@ -114,11 +126,46 @@ def load_artifacts() -> RagArtifacts:
         embedder=embedder,
         faiss_index=index,
         paragraphs=paragraphs,
+        llm=llm
     )
 
 
-def search_vector(artifacts: RagArtifacts, question: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    qvec = artifacts.embedder.encode([question], show_progress_bar=False)
+def analyze_query(llm: ChatGroq, question: str) -> Dict[str, Any]:
+    parser = JsonOutputParser()
+    prompt = PromptTemplate(
+        template="""You are an expert retrieval systems engineer. Analyze the following academic question.
+        Provide a JSON output with exactly two keys:
+        1. 'entities': A list of strings. Extract the core entities (noun phrases, algorithms, datasets, metrics) to search in a Knowledge Graph.
+        2. 'vector_query': A string. Rewrite the question to be optimized for dense vector similarity search.
+        
+        CRITICAL INSTRUCTIONS: 
+        - DO NOT write any Python code.
+        - DO NOT provide explanations. 
+        - DO NOT use markdown formatting like ```json.
+        - OUTPUT ONLY THE RAW JSON OBJECT.
+        
+        {format_instructions}
+        
+        Question: {question}
+        """,
+        input_variables=["question"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
+    )
+    
+    chain = prompt | llm | parser
+    try:
+        result = chain.invoke({"question": question})
+        return {
+            "entities": result.get("entities", fallback_extract_entities(question)),
+            "vector_query": result.get("vector_query", question)
+        }
+    except Exception as e:
+        print(f"Query Analysis Failed: {e}")
+        return {"entities": fallback_extract_entities(question), "vector_query": question}
+
+
+def search_vector(artifacts: RagArtifacts, optimized_query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    qvec = artifacts.embedder.encode([optimized_query], show_progress_bar=False)
     qvec = np.asarray(qvec, dtype="float32")
     faiss.normalize_L2(qvec)
 
@@ -135,9 +182,8 @@ def search_vector(artifacts: RagArtifacts, question: str, top_k: int = 5) -> Lis
     return results
 
 
-def search_graph(artifacts: RagArtifacts, question: str, paper_id: Optional[str], top_k: int = 5) -> List[Dict[str, Any]]:
-    ents = extract_question_entities(question)
-    if not ents:
+def search_graph(artifacts: RagArtifacts, entities: List[str], paper_id: Optional[str], top_k: int = 5) -> List[Dict[str, Any]]:
+    if not entities:
         return []
 
     query = """
@@ -157,7 +203,7 @@ def search_graph(artifacts: RagArtifacts, question: str, paper_id: Optional[str]
     with artifacts.driver.session(database=artifacts.database) as session:
         result = session.run(
             query,
-            entities=[e.lower() for e in ents],
+            entities=[e.lower() for e in entities],
             paper_id=paper_id,
             limit=top_k,
         )
@@ -177,9 +223,8 @@ def search_graph(artifacts: RagArtifacts, question: str, paper_id: Optional[str]
     return rows
 
 
-def search_graph_facts(artifacts: RagArtifacts, question: str, paper_id: Optional[str], top_k: int = 10) -> List[Dict[str, Any]]:
-    ents = extract_question_entities(question)
-    if not ents:
+def search_graph_facts(artifacts: RagArtifacts, entities: List[str], paper_id: Optional[str], top_k: int = 10) -> List[Dict[str, Any]]:
+    if not entities:
         return []
 
     query = """
@@ -198,7 +243,7 @@ def search_graph_facts(artifacts: RagArtifacts, question: str, paper_id: Optiona
     with artifacts.driver.session(database=artifacts.database) as session:
         result = session.run(
             query,
-            entities=[e.lower() for e in ents],
+            entities=[e.lower() for e in entities],
             paper_id=paper_id,
             limit=top_k,
         )
@@ -227,31 +272,6 @@ def deduplicate_paragraphs(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def rank_sentences(question: str, context: str, max_sentences: int = 3) -> str:
-    q_tokens = set(tokenize(question))
-    if not q_tokens:
-        return context[:1000]
-
-    sentences = re.split(r"(?<=[.!?])\s+", context)
-    scored = []
-
-    for sent in sentences:
-        s = normalize_text(sent)
-        if not s:
-            continue
-        s_tokens = set(tokenize(s))
-        score = len(q_tokens & s_tokens)
-        if score > 0:
-            scored.append((score, s))
-
-    if not scored:
-        return sentences[0] if sentences and sentences[0] else context[:1000]
-
-    scored.sort(key=lambda x: (-x[0], len(x[1])))
-    chosen = [s for _, s in scored[:max_sentences]]
-    return " ".join(chosen)
-
-
 def build_context(vector_hits: List[Dict[str, Any]], graph_hits: List[Dict[str, Any]], facts: List[Dict[str, Any]]) -> str:
     parts = []
 
@@ -277,19 +297,47 @@ def build_context(vector_hits: List[Dict[str, Any]], graph_hits: List[Dict[str, 
     return "\n".join(parts).strip()
 
 
+def generate_llm_answer(llm: ChatGroq, question: str, context: str) -> str:
+    prompt = PromptTemplate(
+        template="""You are a strict academic evaluation assistant. 
+        Answer the question using ONLY the provided Context. 
+        If the Context does not contain the answer, output exactly: UNANSWERABLE
+        
+        CRITICAL RULES FOR HIGH F1/EM SCORES:
+        - Keep the answer as short as possible (e.g., a single phrase, entity, or number).
+        - Do not use full sentences. 
+        - Do not add explanations or conversational filler.
+        - Output absolutely nothing except the direct answer.
+        
+        Context:
+        {context}
+        
+        Question: {question}
+        Concise Answer:""",
+        input_variables=["context", "question"]
+    )
+    
+    chain = prompt | llm
+    response = chain.invoke({"context": context, "question": question})
+    return response.content.strip()
+
+
 def answer_question(artifacts: RagArtifacts, question: str, paper_id: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
-    vector_hits = search_vector(artifacts, question, top_k=top_k)
-    graph_hits = search_graph(artifacts, question, paper_id=paper_id, top_k=top_k)
-    facts = search_graph_facts(artifacts, question, paper_id=paper_id, top_k=top_k)
+    query_plan = analyze_query(artifacts.llm, question)
+    entities = query_plan["entities"]
+    vector_query = query_plan["vector_query"]
+
+    vector_hits = search_vector(artifacts, vector_query, top_k=top_k)
+    graph_hits = search_graph(artifacts, entities, paper_id=paper_id, top_k=top_k)
+    facts = search_graph_facts(artifacts, entities, paper_id=paper_id, top_k=top_k)
 
     combined = deduplicate_paragraphs(graph_hits + vector_hits)
     context = build_context(vector_hits=vector_hits, graph_hits=graph_hits, facts=facts)
 
     if combined:
-        merged_text = " ".join([r["text"] for r in combined[: top_k * 2]])
-        answer = rank_sentences(question, merged_text, max_sentences=3)
+        answer = generate_llm_answer(artifacts.llm, question, context)
     else:
-        answer = "I could not find enough supporting text in the paper."
+        answer = "UNANSWERABLE"
 
     return {
         "question": question,
