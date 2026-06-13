@@ -198,23 +198,52 @@ def main() -> None:
         for sent in sentences:
             
             # --- MODIFIED EXTRACTION LOGIC ---
-            # Try LLM extraction first
             try:
+                # 1. Invoke the LLM
                 llm_response = llm_extractor.invoke({"text": sent})
-                triples = llm_response if isinstance(llm_response, list) else [llm_response]
+                print(f"\n[RAW LLM OUTPUT for '{sent[:30]}...']: {llm_response}")
                 
-                # Format relations to match your Neo4j styling
+                # 2. Smart Unwrapping (Handles "data" wrappers)
+                triples = []
+                if isinstance(llm_response, list):
+                    triples = llm_response
+                elif isinstance(llm_response, dict):
+                    # Check if it's a single triple directly
+                    if "subject" in [k.lower() for k in llm_response.keys()]:
+                        triples = [llm_response]
+                    else:
+                        # Dig into keys like 'data' or 'semantic_relationships' to find the list
+                        for val in llm_response.values():
+                            if isinstance(val, list):
+                                triples.extend(val)
+                
+                # 3. Robust key mapping
                 for t in triples:
-                    if all(k in t for k in ["subject", "relation", "object"]):
-                        t["subject"] = clean_phrase(t["subject"])
-                        t["relation"] = str(t["relation"]).strip().upper().replace(" ", "_")
-                        t["object"] = clean_phrase(t["object"])
-                        t["confidence"] = 0.95 # Higher confidence for LLM extraction
+                    if not isinstance(t, dict): # Skip weirdly formatted items
+                        continue
+                        
+                    safe_t = {str(k).lower(): v for k, v in t.items()}
+                    
+                    subj = safe_t.get("subject", safe_t.get("entity1", safe_t.get("source")))
+                    rel = safe_t.get("relation", safe_t.get("predicate", safe_t.get("action")))
+                    obj = safe_t.get("object", safe_t.get("entity2", safe_t.get("target")))
+                    
+                    if subj and rel and obj:
+                        out.append({
+                            "paper_id": row["paper_id"],
+                            "paragraph_id": row["paragraph_id"],
+                            "section_idx": row["section_idx"],
+                            "section_name": row["section_name"],
+                            "sentence": sent,
+                            "subject": clean_phrase(str(subj)),
+                            "relation": str(rel).strip().upper().replace(" ", "_"),
+                            "object": clean_phrase(str(obj)),
+                            "confidence": 0.95
+                        })
             except Exception as e:
-                # If LLM fails (e.g., JSON parsing error), gracefully fall back to original logic
+                print(f"\n[LLM ERROR]: {e}")
                 triples = pattern_triples(sent)
-                if not triples:
-                    triples = cooccurrence_triples(sent, nlp=nlp)
+            # ---------------------------------
             # ---------------------------------
 
             for t in triples:
